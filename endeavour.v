@@ -37,6 +37,7 @@ module endeavour
    input  wire         clk,           // AMAC ring osc, nominally ~ 40 MHz
    input  wire [4:0]   chipid_pads,   // wire-bonded chip ID number
    input  wire [19:0]  efuse_chipid,  // chip ID number from efuse PROM
+   output wire         do_efuse_load, // cause efuse PROM to be read -> chipid
    // communication with end-of-stave card
    input  wire         serialin,      // single-ended version of command input
    output wire         serialout,     // response to EOS card
@@ -56,12 +57,27 @@ module endeavour
     wire       commid_known;   // has the commid been set yet?
     wire [4:0] commid_d;
     reg        do_set_commid;  // combinational, not FF
+    wire       commid_frozen;  // should SETID commands be rejected?
     dffe_nbit_t #(.W(6), .PU(6'b011111)) 
     commid_reg_t  // SEU-protected 'commid' register
       ( .rstb(hardrstb), .clk(clk),
-	.ena(do_set_commid && !commid_known),
+	.ena(do_set_commid && !commid_frozen),
 	.d({1'b1,commid_d}),
 	.q({commid_known,commid}),
+	.serOut()  // soft-error output unused
+	);
+    // SEU-protected 'commid-is-frozen' register. When set, SETID requests
+    // are ignored. Powers up LOW, so that SETID is permitted. Goes HIGH once
+    // a SETID has been accepted. Goes LOW again if the "broadcast" command
+    // is issued that loads eFUSE serial number into transient registers.
+    reg commid_frozen_ena;  // combinational, not FF
+    reg commid_frozen_d;    // combinational, not FF
+    dffe_nbit_t #(.W(1), .PU(1'b0)) 
+    commid_frozen_t  // SEU-protected 'commid-is-frozen' register
+      ( .rstb(hardrstb), .clk(clk),
+	.ena(commid_frozen_ena),
+	.d(commid_frozen_d),
+	.q(commid_frozen),
 	.serOut()  // soft-error output unused
 	);
     // Synchronize incoming serial data (from EOS card, independent clock)
@@ -100,6 +116,7 @@ module endeavour
     localparam TICKS_DIT = 16;     // tBLIP + tDIT = max width of DIT
     localparam TICKS_DMZ = 4;      // tBLIP + tDIT + tDMZ = min width of DAH
     localparam TICKS_DAH = 96;     // tBLIP + ... + tDAH = max width of DAH
+    localparam TICKS_QUIET = 96;   // activey driven silence after reply
     localparam TICKS_BITGAP = 8;   // minimum gap between bits
     localparam TICKS_NEXTBIT = 64; // tBITGAP + tNEXTBIT = max gap betw bits
     localparam TICKS_TXDIT = 8;    // width of reply DIT
@@ -127,9 +144,13 @@ module endeavour
     wire [4:0]  sreg_padid   = sreg[12:8];
     wire id_match = commid_known && (sreg_id == commid);
     wire setid_match =
-	 (!commid_known) &&
+	 (!commid_frozen) &&
 	 ((sreg_efuseid==efuse_chipid && sreg_padid==5'b11111) ||
 	  (sreg_efuseid==20'hfffff    && sreg_padid==chipid_pads));
+    wire efuseload_match = 
+         sreg_efuseid==20'hfffff &&
+         commid_d==5'b11111 &&
+         sreg_padid==5'b11111;
     // Remember last-used read address, for RDNEXT command
     reg [7:0] rdaddr;
     reg [7:0] rdaddr_d;    // combinational, not FF
@@ -267,6 +288,20 @@ module endeavour
 	    ticks <= ticks + 1'b1;
 	end
     end
+    // 'do_efuse_load_ff' is a FF copy of 'do_do_efuse_load', which
+    // is a combinational output of the FSM.  When it goes high,
+    // external logic will cause the eFuse PROM to be read into the
+    // transient register that drives 'efuse_chipid'.
+    reg do_efuse_load_ff;
+    reg do_do_efuse_load;  // combinational, not FF
+    always @ (posedge clk or negedge rstb) begin
+        if (!rstb) begin
+            do_efuse_load_ff <= 1'b0;
+        end else begin
+            do_efuse_load_ff <= do_do_efuse_load;
+        end
+    end
+    assign do_efuse_load = do_efuse_load_ff;  // drive module output wire
     // Use flip-flops to drive serial output (reply to EOS card)
     reg dout_ff, douten_ff;
     reg dout, douten;  // combinational, not FF
@@ -289,42 +324,49 @@ module endeavour
       SETIDCMD=7'd13, SETIDCMD1=7'd14, RDNEXTCMD=7'd15, RDCMD=7'd16,
       RDCMD1=7'd17, RDCMD2=7'd18, RDCMD3=7'd19, RDCMD4=7'd20, RDCMD5=7'd21,
       RDCMD9=7'd22, REPLY=7'd23, REPLYLOOP=7'd24, SEND_DIT=7'd25,
-      SEND_DAH=7'd26, SEND_BITGAP=7'd27, ERROR=7'd31;
-    reg [6:0] fsm, fsm_prev;  // flip-flops
+      SEND_DAH=7'd26, SEND_BITGAP=7'd27, EFUSECMD=7'd28, EOFQUIET=7'd29,
+      ERROR=7'd31;
+    wire [6:0] fsm;
+    reg [6:0] fsm_prev;  // flip-flop
     reg [6:0] fsm_d;  // combinational logic
+    dffe_nbit_t #(.W(7), .PU(7'd0))
+    fsm_reg_t  // SEU-protected 'fsm' register: current FSM state
+      ( .rstb(rstb), .clk(clk), .ena(1'b1),
+        .d(fsm_d), .q(fsm), .serOut());  // soft-error output unused
     always @ (posedge clk or negedge rstb) begin
 	if (!rstb) begin
-	    fsm <= START;
 	    fsm_prev <= START;
 	end else begin
-	    fsm <= fsm_d;  // next state from combinational logic
 	    fsm_prev <= fsm;  // remember state from one cycle ago
 	end
     end
     // The following is a COMBINATIONAL always block
     always @ (*) begin
 	// Assign default values to avoid risk of implicit latches
-	fsm_d            = START;
-	sreg_clear       = 1'b0;
-	sreg_in          = 1'b0;
-	sreg_shift       = 1'b0;
-	ticks_clear      = 1'b0;
-	bitcount_clear   = 1'b0;
-	bitcount_inc     = 1'b0;
-	bitcountnp_ena   = 1'b0;
-	wstrobe_d        = 1'b0;
-	rstrobe_d        = 1'b0;
-	rshift_d         = 1'b0;
-	douten           = 1'b0;
-	dout             = 1'b0;
-	srout_load       = 1'b0;
-	srout_shift      = 1'b0;
-	srout_bitcount_d = 6'b0;
-	seqnum_inc       = 1'b0;
-	do_set_commid    = 1'b0;
-	rdaddr_ena       = 1'b0;
-	rdaddr_d         = 8'b0;
-	addr_clear       = 1'b0;
+	fsm_d             = START;
+	sreg_clear        = 1'b0;
+	sreg_in           = 1'b0;
+	sreg_shift        = 1'b0;
+	ticks_clear       = 1'b0;
+	bitcount_clear    = 1'b0;
+	bitcount_inc      = 1'b0;
+	bitcountnp_ena    = 1'b0;
+	wstrobe_d         = 1'b0;
+	rstrobe_d         = 1'b0;
+	rshift_d          = 1'b0;
+	douten            = 1'b0;
+	dout              = 1'b0;
+	srout_load        = 1'b0;
+	srout_shift       = 1'b0;
+	srout_bitcount_d  = 6'b0;
+	seqnum_inc        = 1'b0;
+	do_set_commid     = 1'b0;
+        do_do_efuse_load  = 1'b0;
+	rdaddr_ena        = 1'b0;
+	rdaddr_d          = 8'b0;
+	addr_clear        = 1'b0;
+        commid_frozen_ena = 1'b0;
+        commid_frozen_d   = 1'b1;
 	case (fsm)
 	    START:
 	      // Initial state.  Wait for DIN to go LOW.
@@ -476,9 +518,15 @@ module endeavour
 	    EOT:
 	      // Complete message received into sreg, left-aligned.
 	      begin
-		  $display("EOT: sreg=%x, bitcount=%d/%d", 
-			   sreg, bitcountnp, bitcount);
-		  if (sreg_cmd==CMD_SETID && 
+		  $strobe("EOT: sreg=%x, bitcount=%d/%d", 
+			  sreg, bitcountnp, bitcount);
+                  if (sreg_cmd==CMD_SETID &&
+                      bitcountnp==WRCMD_NBITS &&
+                      efuseload_match && crcok)
+                  begin
+		      seqnum_inc = 1'b1;
+		      fsm_d = EFUSECMD;
+		  end else if (sreg_cmd==CMD_SETID && 
 		      bitcountnp==WRCMD_NBITS &&
 		      setid_match && crcok)
 		  begin
@@ -510,8 +558,8 @@ module endeavour
 	      // valid state code.
 	      begin
 		  if (fsm_prev==EOT) begin
-		      $display("WRCMD: addr=%02x data=%08x crc=%02x", 
-			       sreg_addr, sreg_data, sreg_crc);
+		      $strobe("WRCMD: addr=%02x data=%08x crc=%02x", 
+			      sreg_addr, sreg_data, sreg_crc);
 		      wstrobe_d = 1'b1;
 		      srout_bitcount_d = SHORT_REPLY_NBITS;
 		      srout_load = 1'b1;
@@ -527,7 +575,7 @@ module endeavour
 	    SETIDCMD:
 	      // Process a SETID command.
 	      begin
-		  $display("SETID: seqnum=%x commid=%x", seqnum, commid_d);
+		  $strobe("SETID: seqnum=%x commid=%x", seqnum, commid_d);
 		  // Insist that all unused bits of request be 1.
 		  if (sreg[55:48]==8'b11011111 &&
 		      sreg[47:45]==3'b111 &&
@@ -535,6 +583,8 @@ module endeavour
 		      sreg[15:13]==3'b111)
 		  begin
 		      do_set_commid = 1'b1;
+                      commid_frozen_d = 1'b1;
+                      commid_frozen_ena = 1'b1;
 		      fsm_d = SETIDCMD1;
 		  end else begin
 		      fsm_d = ERROR;
@@ -555,7 +605,7 @@ module endeavour
 	    RDCMD:
 	      // Process a READ command.
 	      begin
-		  $display("RDCMD: addr=%02x", sreg_addr);
+		  $strobe("RDCMD: addr=%02x", sreg_addr);
 		  fsm_d = RDCMD1;
 		  rdaddr_d = sreg_addr;
 		  rdaddr_ena = 1'b1;
@@ -597,7 +647,7 @@ module endeavour
 	    RDCMD9:
 	      begin
 		  // comment
-		  $display("RDCMD9: a=%02x d=%08x", sreg_addr, srin);
+		  $strobe("RDCMD9: a=%02x d=%08x", sreg_addr, srin);
 		  srout_bitcount_d = LONG_REPLY_NBITS;
 		  srout_load = 1'b1;
 		  fsm_d = REPLY;
@@ -619,13 +669,28 @@ module endeavour
 		  addr_clear = 1'b1;
 		  douten = 1'b1;
 		  if (srout_bitcount==6'b0) begin
-		      fsm_d = START;
+		      fsm_d = EOFQUIET;
 		  end else if (srout[47]) begin
 		      fsm_d = SEND_DAH;
 		  end else begin
 		      fsm_d = SEND_DIT;
 		  end
 	      end
+            EOFQUIET:
+              // At end of transmitting reply word, actively drive
+              // quiescent state for 96 ticks (about 2.4 microseconds,
+              // nominally), which is a little longer than the maximum
+              // allowed intra-word gap (72 or so ticks) between bits.
+              begin
+                  douten = 1'b1;
+                  dout = 1'b0;
+                  if (ticks < TICKS_QUIET) begin
+                      fsm_d = EOFQUIET;
+                  end else begin
+                      ticks_clear = 1'b1;
+                      fsm_d = START;
+                  end
+              end
 	    SEND_DIT:
 	      // Transmit a short ("DIT") pulse to EOS card
 	      begin
@@ -661,19 +726,46 @@ module endeavour
 		      fsm_d = REPLYLOOP;
 		  end
 	      end
+	    EFUSECMD:
+	      // Process an 'EFUSELOAD' command, which is a special
+              // case of the SETID command whose only effect is to
+              // cause the eFuse PROM to be read (by external logic)
+              // into a transient register
+	      begin
+		  $strobe("EFUSELOAD: seqnum=%x sreg=%x", 
+                          seqnum, sreg, $time);
+		  // Insist that all unused bits of request be 1.
+		  // Note that 'padid' bits were already checked in
+		  // 'efuseload_match' condition.
+		  if (sreg[55:48]==8'b11011111 &&
+		      sreg[47:40]==8'b11111111 &&
+		      sreg[39:36]==4'b1111 &&
+		      sreg[15:13]==3'b111)
+		  begin
+		      $strobe("EFUSELOAD: do_do_efuse_load", $time);
+		      do_do_efuse_load = 1'b1;
+                      // As a side effect, also unfreeze the COMMID so
+                      // that a subsequent SETID command will be
+                      // accepted.
+                      commid_frozen_d = 1'b0;
+                      commid_frozen_ena = 1'b1;
+		  end
+                  // This is a broadcast request, so it gets no reply
+		  fsm_d = ERROR;
+	      end
 	    ERROR:
 	      // Error condition detected; state from which we branched
 	      // here is recorded (for one tick) in 'fsm_prev'.  We may
 	      // eventually maintain some registers counting errors or
 	      // recording which state recently detected an error.
 	      begin
-		  $display("ERROR: fsm_prev=%d", fsm_prev);
+		  $strobe("ERROR: fsm_prev=%d", fsm_prev);
 		  addr_clear = 1'b1;
 		  fsm_d = START;
 	      end
 	    default:
 	      begin
-		  $display("INVALID STATE: fsm=%d fsm_prev=%d", 
+		  $strobe("INVALID STATE: fsm=%d fsm_prev=%d", 
 			   fsm, fsm_prev);
 		  addr_clear = 1'b1;
 		  fsm_d = START;
